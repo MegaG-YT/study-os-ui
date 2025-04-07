@@ -1,10 +1,12 @@
 import { OpenAI } from 'openai';
+import supabase from '../../lib/supabaseClient';
 
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
 const assistantId = 'asst_h6oJGmOfMpf8XkDcWb41hcg9';
+const threadId = 'thread_kG7PKJW5mbNEY8VBsDt8IrDb';
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
@@ -18,41 +20,59 @@ export default async function handler(req, res) {
   }
 
   try {
-    // 🔁 1. Create a fresh thread for this request
-    const thread = await openai.beta.threads.create();
+    // ✅ 1. Check Supabase cache
+    const { data, error } = await supabase
+      .from('keyword_cache')
+      .select('*')
+      .eq('keyword', keyword)
+      .limit(1);
 
-    // ✉️ 2. Add user message to that thread
-    await openai.beta.threads.messages.create(thread.id, {
+    if (error) {
+      console.error('Supabase SELECT error:', error);
+    }
+
+    if (data && data.length > 0) {
+      // ✅ Cached result found
+      return res.status(200).json({ result: data[0].response });
+    }
+
+    // ⚙️ 2. No cache hit → ask Assistant
+    await openai.beta.threads.messages.create(threadId, {
       role: 'user',
       content: keyword,
     });
 
-    // 🧠 3. Run the assistant on that thread
-    const run = await openai.beta.threads.runs.create(thread.id, {
+    const run = await openai.beta.threads.runs.create(threadId, {
       assistant_id: assistantId,
     });
 
-    // ⏳ 4. Poll until completion
     let runStatus;
     while (true) {
-      runStatus = await openai.beta.threads.runs.retrieve(thread.id, run.id);
+      runStatus = await openai.beta.threads.runs.retrieve(threadId, run.id);
       if (runStatus.status === 'completed') break;
       if (runStatus.status === 'failed') throw new Error('Run failed');
       await new Promise((r) => setTimeout(r, 1000));
     }
 
-    // 📬 5. Retrieve the final message
-    const messages = await openai.beta.threads.messages.list(thread.id);
+    const messages = await openai.beta.threads.messages.list(threadId);
     const lastMessage = messages.data[0];
+    const aiResponse = lastMessage.content[0].text.value;
 
-    // (Optional) Clean up thread afterwards
-    await openai.beta.threads.del(thread.id);
+    // 🧠 3. Save to Supabase
+    const insertResult = await supabase.from('keyword_cache').insert([
+      {
+        keyword: keyword,
+        response: aiResponse,
+      },
+    ]);
 
-    // ✅ 6. Send result to client
-    res.status(200).json({ result: lastMessage.content[0].text.value });
+    if (insertResult.error) {
+      console.error('Supabase INSERT error:', insertResult.error);
+    }
 
+    res.status(200).json({ result: aiResponse });
   } catch (error) {
-    console.error(error);
+    console.error('Handler error:', error);
     res.status(500).json({ error: 'Something went wrong' });
   }
 }
